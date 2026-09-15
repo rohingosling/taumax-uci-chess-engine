@@ -1,0 +1,156 @@
+# ---------------------------------------------------------------------------
+# Build and release the Taumax UCI Chess Engine executable.
+#
+# Triggered manually (workflow_dispatch). Resolves the version from the
+# RELEASE_VERSION repository variable, runs `cargo test` and `cargo build --release`
+# on a Windows runner, then recreates the rolling GitHub Release v<version> and
+# attaches the single user-facing executable with signed SLSA build provenance:
+#
+#       gh attestation verify taumax.exe --repo rohingosling/taumax-uci-chess-engine
+# ---------------------------------------------------------------------------
+
+name: Build and release executable
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (blank = use the RELEASE_VERSION repo variable)'
+        required: false
+        default: ''
+
+permissions:
+  contents:     write   # create the Release and upload assets
+  id-token:     write   # OIDC token for provenance attestation
+  attestations: write   # write the signed provenance statement
+
+jobs:
+
+  # -------------------------------------------------------------------------
+  # Resolve the version and (re)create the rolling release at this commit.
+  # -------------------------------------------------------------------------
+
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag:     ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve release version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          VAR_VERSION:   ${{ vars.RELEASE_VERSION }}
+        shell: bash
+        run: |
+          version="${INPUT_VERSION:-$VAR_VERSION}"
+          version="${version:-1.0.0}"   # hardcoded fallback if the variable is unset
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version"     >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $version (tag v$version)"
+
+      - name: Recreate rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG:      ${{ steps.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create "$TAG" \
+            --repo   "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title  "$TAG" \
+            --notes  "Automated clean-room build from GitHub Actions. Verify provenance with: gh attestation verify taumax.exe --repo $GITHUB_REPOSITORY"
+
+  # -------------------------------------------------------------------------
+  # Build the single user-facing executable and attach it to the release.
+  # -------------------------------------------------------------------------
+
+  build:
+    name: Build taumax.exe
+    needs: prepare
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stamp version into Cargo.toml
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python - "$VERSION" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          path    = "Cargo.toml"
+          text    = open(path, encoding="utf-8").read()
+          text    = re.sub(r'(?m)^(version\s*=\s*")[^"]*(")', r"\g<1>" + version + r"\2", text, count=1)
+          open(path, "w", encoding="utf-8").write(text)
+          print("stamped Cargo.toml [package] version =", version)
+          PY
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke UCI option surface
+        shell: bash
+        env:
+          BINARY: target/release/taumax.exe
+        run: |
+          output="$(printf 'uci\nquit\n' | "$BINARY")"
+          echo "$output"
+
+          grep -q '^id name Taumax$' <<< "$output"
+          grep -q '^id author Rohin Gosling$' <<< "$output"
+          grep -q '^option name Strategy type combo default Random var Random var RelativeCausalEntropy$' <<< "$output"
+          grep -q '^option name Max Depth type spin default 6 min 1 max 12$' <<< "$output"
+          grep -q '^option name Random Seed type string$' <<< "$output"
+          grep -q '^option name Diagnostics Trace type check default false$' <<< "$output"
+          grep -q '^option name GPU Acceleration type check default false$' <<< "$output"
+          grep -q '^uciok$' <<< "$output"
+
+      - name: Smoke GPU request fallback
+        shell: bash
+        env:
+          BINARY: target/release/taumax.exe
+        run: |
+          output="$(
+            printf '%s\n' \
+              'setoption name Strategy value RelativeCausalEntropy' \
+              'setoption name GPU Acceleration value true' \
+              'setoption name Diagnostics Trace value true' \
+              'position startpos' \
+              'go searchmoves e2e4 depth 2' \
+              'quit' | "$BINARY"
+          )"
+          echo "$output"
+
+          grep -q 'gpuRequested=yes' <<< "$output"
+          grep -Eq 'leafBackend=(cpu-batch|gpu-batch)' <<< "$output"
+          grep -q '^bestmove e2e4$' <<< "$output"
+
+      - name: Stage release asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/taumax.exe" "dist/taumax.exe"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/taumax.exe
+
+      - name: Upload taumax.exe to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG:      ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: gh release upload "$TAG" "dist/taumax.exe" --repo "$GITHUB_REPOSITORY" --clobber
